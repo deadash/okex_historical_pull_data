@@ -19,20 +19,32 @@ jobs:
             target: x86_64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            extension: .exe
+          - os: windows-latest
+            target: i686-pc-windows-msvc
+            extension: .exe
+
     steps:
       - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
+      
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
           target: ${{ matrix.target }}
           override: true
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
+      - name: Prepare Artifacts
+        run: |
+          mv target/${{ matrix.target }}/release/pull_data${{ matrix.extension | default('') }} pull_data${{ matrix.extension | default('') }}
+
       - name: Upload Artifacts
         uses: actions/upload-artifact@v2
         with:
           name: ${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/myapp
+          path: pull_data${{ matrix.extension | default('') }}
+  
 
   release:
     needs: build
