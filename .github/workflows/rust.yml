@@ -1,9 +1,12 @@
 name: Release
 
+permissions:
+  contents: write
+
 on:
   push:
     tags:
-      - 'v*'
+      - v[0-9]+.*
 
 jobs:
   build:
@@ -19,42 +22,15 @@ jobs:
             target: x86_64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            extension: .exe
-          - os: windows-latest
-            target: i686-pc-windows-msvc
-            extension: .exe
 
     steps:
-      - uses: actions/checkout@v2
-      
-      - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v4
+      - uses: taiki-e/upload-rust-binary-action@v1
         with:
-          toolchain: stable
+          bin: pull_data
           target: ${{ matrix.target }}
-          override: true
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
-      - name: Prepare Artifacts
-        run: mv target/${{ matrix.target }}/release/pull_data${{ matrix.extension | default('') }} pull_data${{ matrix.extension | default('') }}
+          tar: unix
+          zip: windows
+          archive: okx-$bin-$tag-$target
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@v2
-        with:
-          name: ${{ matrix.target }}
-          path: pull_data${{ matrix.extension | default('') }}
-  
-
-  release:
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v2
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
-        with:
-          files: |
-            **/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
