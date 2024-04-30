@@ -205,7 +205,7 @@ impl DateFilesFetcher {
         while continue_fetching {
             let mut url = self.base_url.clone();
             let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
-            url.query_pairs_mut().append_pair("path", &format!("cdn/okex/traderecords/trades/daily/{}", date));
+            url.query_pairs_mut().append_pair("path", &format!("cdn/okex/traderecords/{}/daily/{}", self.data_type.as_str(), date));
             url.query_pairs_mut().append_pair("size", "100");
             url.query_pairs_mut().append_pair("t", &timestamp.to_string());
             if let Some(marker) = &next_marker {
