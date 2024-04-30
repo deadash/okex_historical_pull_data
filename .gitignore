@@ -4,3 +4,4 @@
 *.json
 *.exe
 !Cargo.toml
+*.log
