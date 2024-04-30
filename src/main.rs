@@ -1,4 +1,3 @@
-#![feature(async_closure)]
 // main.rs
 mod data_fetcher;
 use data_fetcher::{DataType, DateFilesFetcher};
