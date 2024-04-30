@@ -2,16 +2,17 @@
 use anyhow::{Result, Context};
 use chrono::{Local, NaiveDate};
 use clap::ValueEnum;
-use futures::future::join_all;
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::{Client, Url};
 use serde_json::Value;
+use tokio::sync::{Mutex, Semaphore};
+use tokio::task::JoinHandle;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::fs::{self, File};
+use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use toml::Value as TomlValue;
 
 // 定义支持的数据类型
 // https://www.okx.com/priapi/v5/broker/public/v2/orderRecord?path=cdn/okex/traderecords&nextMarker=&size=30
@@ -51,39 +52,50 @@ pub struct DateFilesFetcher {
     last_update: Option<NaiveDate>,
     ignore_undownloaded: bool,
     data_type: DataType,
+    today: NaiveDate,
 }
 
 impl DateFilesFetcher {
     pub async fn new(data_type: DataType) -> Result<Self> {
         let client = Client::new();
         let base_url = Url::parse("https://www.okx.com/priapi/v5/broker/public/v2/orderRecord").unwrap();
+        let today = Local::now().date_naive();
         let mut fetcher = DateFilesFetcher {
             client,
             base_url,
-            data_store_path: format!("{}.toml", data_type.as_str()),
+            data_store_path: format!("{}.json", data_type.as_str()),
             records: HashMap::new(),
             last_update: None,
             ignore_undownloaded: false,
             data_type,
+            today,
         };
 
         // 尝试加载本地文件
         if Path::new(&fetcher.data_store_path).exists() {
             // 尝试加载，如果成功则不动，失败则拉取数据
             if let Err(_) = fetcher.load_from_file().await {
+                log::info!("无法加载历史文件，重新拉取历史数据....");
                 // 如果加载失败，则从网络重新拉取
                 fetcher.fetch_and_save().await?;
             } else {
                 // 检查数据是否是最新的，如果不是今天的，则更新
-                if Some(Local::today().naive_local()) != fetcher.last_update {
+                if Some(fetcher.today) != fetcher.last_update {
+                    log::info!("历史数据存在更新，拉取更新数据.....");
                     fetcher.fetch_and_save().await?;
                 }
             }
         } else {
             // 文件不存在，直接拉取数据
+            log::info!("无法加载历史文件，重新拉取历史数据....");
             fetcher.fetch_and_save().await?;
         }
+        log::info!("加载数据成功, 一共有 {} 天数据", fetcher.get_records_num());
         Ok(fetcher)
+    }
+
+    fn get_records_num(&self) -> usize {
+        self.records.len()
     }
 
     pub fn set_ignore_undownloaded(&mut self) {
@@ -94,31 +106,38 @@ impl DateFilesFetcher {
         let mut file = File::open(&self.data_store_path).await.context("Failed to open file")?;
         let mut contents = String::new();
         file.read_to_string(&mut contents).await.context("Failed to read file")?;
-        let toml_data: TomlValue = toml::from_str(&contents).context("Failed to parse TOML data")?;
-
-        self.records = toml_data["dates"].as_table().unwrap().iter().map(|(date, record)| {
-            let record = record.as_table().unwrap();
-            let files = record["files"].as_array().unwrap().iter().map(|file| {
-                let file = file.as_table().unwrap();
-                FileRecord {
-                    file_name: file["file_name"].as_str().unwrap().to_string(),
-                }
+        let json_data: serde_json::Value = serde_json::from_str(&contents).context("Failed to parse JSON data")?;
+    
+        // 解析 last_update
+        if let Some(last_update_str) = json_data["last_update"].as_str() {
+            self.last_update = Some(NaiveDate::parse_from_str(last_update_str, "%Y-%m-%d")?);
+        }
+    
+        // 解析 dates
+        if let Some(dates) = json_data["dates"].as_object() {
+            self.records = dates.iter().map(|(date, record)| {
+                let downloaded = record["downloaded"].as_bool().unwrap_or(false);
+                let files = record["files"].as_array().unwrap_or(&vec![]).iter().map(|file| {
+                    FileRecord {
+                        file_name: file.as_str().unwrap().to_string(),
+                    }
+                }).collect();
+    
+                (date.clone(), DateRecord {
+                    downloaded,
+                    files,
+                })
             }).collect();
+        }
 
-            (date.clone(), DateRecord {
-                downloaded: record["downloaded"].as_bool().unwrap(),
-                files,
-            })
-        }).collect();
-
-        self.last_update = Some(NaiveDate::parse_from_str(toml_data["last_update"].as_str().unwrap(), "%Y-%m-%d")?);
         Ok(())
     }
+    
 
     async fn fetch_and_save(&mut self) -> Result<()> {
         // Assume fetch_dates now takes an optional NaiveDate and fetches dates after this date
         self.records = self.fetch_dates(self.last_update).await?;
-        self.last_update = Some(Local::today().naive_local()); // Update the last update time to today
+        self.last_update = Some(self.today); // Update the last update time to today
         self.save_to_file().await
     }
 
@@ -155,10 +174,18 @@ impl DateFilesFetcher {
                         break;
                     }
                 }
+                if naive_date == self.today {
+                    continue; // Skip today's files
+                }
                 records.insert(date_str, DateRecord {
                     downloaded: false,
                     files: Vec::new(),
                 });
+            }
+
+            // 时间
+            if !continue_fetching {
+                break;
             }
     
             continue_fetching = data["data"]["isTruncate"].as_bool().unwrap_or(false);
@@ -203,40 +230,35 @@ impl DateFilesFetcher {
     }
 
     async fn save_to_file(&self) -> Result<()> {
-        let mut data = toml::value::Table::new();
+        let mut data = serde_json::Map::new();
 
         // 存储最后更新日期
         if let Some(last_update) = self.last_update {
-            data.insert(
-                "last_update".to_string(), 
-                toml::Value::String(last_update.format("%Y-%m-%d").to_string())
-            );
+            data.insert("last_update".to_string(), serde_json::Value::String(last_update.format("%Y-%m-%d").to_string()));
         }
-
-        // 为每个日期准备一个子表，包含文件列表及其下载状态
-        let dates_table = self.records.iter().map(|(date, date_record)| {
-            let files_array = toml::Value::Array(date_record.files.iter().map(|file| {
-                let mut file_table = toml::value::Table::new();
-                file_table.insert("file_name".to_string(), toml::Value::String(file.file_name.clone()));
-                toml::Value::Table(file_table)
-            }).collect());
-
-            let mut date_table = toml::value::Table::new();
-            date_table.insert("downloaded".to_string(), toml::Value::Boolean(date_record.downloaded));
-            date_table.insert("files".to_string(), files_array);
-
-            (date.clone(), toml::Value::Table(date_table))
-        }).collect();
-
-        data.insert("dates".to_string(), toml::Value::Table(dates_table));
-
-        // 将数据转换为 TOML 格式的字符串
-        let toml_string = toml::to_string(&data).context("Failed to serialize data to TOML")?;
-
+    
+        // 为每个日期准备一个记录，包含文件列表及其下载状态
+        let dates = self.records.iter().map(|(date, date_record)| {
+            let files: Vec<serde_json::Value> = date_record.files.iter().map(|file| serde_json::Value::String(file.file_name.clone())).collect();
+    
+            (
+                date.clone(), 
+                serde_json::json!({
+                    "downloaded": date_record.downloaded,
+                    "files": files
+                })
+            )
+        }).collect::<serde_json::Map<_, _>>();
+    
+        data.insert("dates".to_string(), serde_json::Value::Object(dates));
+    
+        // 将数据转换为 JSON 格式的字符串
+        let json_string = serde_json::to_string_pretty(&data).context("Failed to serialize data to JSON")?;
+    
         // 写入文件
         let mut file = File::create(&self.data_store_path).await.context("Failed to create or open the file")?;
-        file.write_all(toml_string.as_bytes()).await.context("Failed to write data to file")?;
-
+        file.write_all(json_string.as_bytes()).await.context("Failed to write data to file")?;
+    
         Ok(())
     }
 
@@ -249,6 +271,7 @@ impl DateFilesFetcher {
         // 创建一个临时集合来存储更新后的文件列表
         let mut updated_records = HashMap::new();
         let pb = ProgressBar::new(self.records.len() as u64);
+        log::info!("更新文件列表......");
         pb.set_style(ProgressStyle::default_bar().template("{wide_bar} {pos}/{len} Fetching file lists...")?);
 
         let mut not_downloaded_count = 0; // 用于计数未下载的记录
@@ -273,85 +296,86 @@ impl DateFilesFetcher {
         }
 
         pb.finish_with_message("All file lists fetched and updated.");
+        log::info!("文件列表获取成功(共{}天未下载)，保存中....", not_downloaded_count);
         self.save_to_file().await?;  // Save updates after fetching all file lists
         Ok(not_downloaded_count)  // Return the count of updated records
     }
 
     // 函数来下载还未下载的文件
     pub async fn download_unfetched_files(&mut self, filter: impl Fn(&str) -> bool) -> Result<()> {
-        let updated_count = self.update_file_lists().await?;
+        // 先更新一下列表
+        let _record_num = self.update_file_lists().await?;
 
-        let pb = ProgressBar::new(updated_count as u64);
-        pb.set_style(ProgressStyle::default_bar().template("{wide_bar} {pos}/{len} {msg}")?);
-    
-        // 创建一个新的HashMap以更新记录的下载状态
-        let mut download_status = HashMap::new();
+        log::info!("开始下载未下载的文件.....");
+        let max_concurrent_downloads = 20;
+        let semaphore = Arc::new(Semaphore::new(max_concurrent_downloads));
+        let mut tasks: Vec<JoinHandle<Result<(bool, String), anyhow::Error>>> = Vec::new();
+
+        // Separate data for download tasks
+        let mut downloads = Vec::new();
+        let mut download_status: HashMap<String, bool> = HashMap::new();
 
         for (date, record) in &self.records {
-            let need_download = !record.downloaded || self.ignore_undownloaded;
-            if need_download && !record.files.is_empty() {
-                println!("Fetching files for date: {}", date);
-                pb.set_message(format!("Processing {}", date));
-                let file_path = format!("./data/{}/{}", self.data_type.as_str(), date);
-
-                // 确保目标目录存在
-                fs::create_dir_all(&file_path).await.context("Failed to create directory for file downloads")?;
-
-                let download_tasks: Vec<_> = record.files.iter().filter(|file| filter(&file.file_name))
-                    .map(|file| {
-                        let file_url = self.build_file_download_url(date, &file.file_name);
-                        let save_path = format!("{}/{}", file_path, file.file_name);
-                        self.download_and_save_file(file_url, save_path)
-                    }).collect();
-
-                // 使用 join_all 等待所有下载任务完成
-                let mut all_successful = true;
-                let results = join_all(download_tasks).await;
-                for result in results {
-                    match result {
-                        Ok(filename) => println!("Download completed. -- {filename}"),
-                        Err(e) => {
-                            eprintln!("Download failed: {}", e);
-                            all_successful = false;
-                        },
-                    }
-                }
-
-                if all_successful {
-                    download_status.insert(date.clone(), true);
+            let file_path = format!("./data/{}/{}", self.data_type.as_str(), date);
+            tokio::fs::create_dir_all(&file_path).await?;
+            
+            let mut all_exist = true;
+            for file in &record.files {
+                if filter(&file.file_name) && !Path::new(&format!("{}/{}", file_path, file.file_name)).exists() {
+                    let file_url = self.build_file_download_url(date, &file.file_name);
+                    let save_path = format!("{}/{}", file_path, file.file_name);
+                    downloads.push((file_url, save_path, date.clone()));
+                    all_exist = false;
                 }
             }
-            pb.inc(1);
+            download_status.insert(date.clone(), all_exist);
         }
 
-        // 更新下载状态
+        let pb = Arc::new(Mutex::new(ProgressBar::new(downloads.len() as u64)));
+        pb.lock().await.set_style(ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")?
+            .progress_chars("#>-"));
+
+        // Create tasks without reference to self
+        for (file_url, save_path, date) in downloads {
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let pb_clone = pb.clone();
+            tasks.push(tokio::spawn(async move {
+                let result = Self::download_and_save_file(file_url, save_path).await;
+                drop(permit);
+                pb_clone.lock().await.inc(1);
+                result.map(|_| (true, date.clone()))
+            }));
+        }
+
+        log::info!("打包下载任务数量: {}", tasks.len());
+
+        // Process all tasks and handle their results
+        for task in tasks {
+            let (success, date) = task.await??;
+            download_status.insert(date, success);
+        }
+
+        pb.lock().await.finish_with_message("All files processed.");
+
+        // Update the records after all downloads
         for (date, status) in download_status {
             if let Some(record) = self.records.get_mut(&date) {
                 record.downloaded = status;
             }
         }
 
-        // 保存更新后的记录
-        self.save_to_file().await?;
-        pb.finish_with_message("All files processed.");
         Ok(())
+    
     }
 
-    async fn download_and_save_file(&self, file_url: String, save_path: String) -> Result<String> {
-        if fs::metadata(&save_path).await.is_ok() {
-            return Ok(save_path.to_owned());
+    async fn download_and_save_file(file_url: String, save_path: String) -> Result<()> {
+        let mut response = reqwest::get(&file_url).await?;
+        let mut file = tokio::fs::File::create(save_path).await?;
+        while let Some(chunk) = response.chunk().await? {
+            file.write_all(&chunk).await?;
         }
-        let response = self.client.get(&file_url).send().await
-            .with_context(|| format!("Failed to read bytes from response for URL {}", file_url))?;
-        let content = response
-            .bytes()
-            .await
-            .with_context(|| format!("Failed to create file at {}", save_path))?;
-        let mut file = File::create(&save_path).await?;
-        file.write_all(&content)
-            .await
-            .with_context(|| format!("Failed to write data to file at {}", save_path))?;
-        Ok(save_path.to_owned())
+        Ok(())
     }
 
 }

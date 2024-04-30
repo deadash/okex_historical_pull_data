@@ -1,4 +1,6 @@
 /target
 /data
 *.toml
+*.json
+*.exe
 !Cargo.toml

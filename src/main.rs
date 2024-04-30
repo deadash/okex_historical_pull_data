@@ -1,3 +1,4 @@
+#![feature(async_closure)]
 // main.rs
 mod data_fetcher;
 use data_fetcher::{DataType, DateFilesFetcher};
@@ -24,8 +25,32 @@ struct Args {
     exclude_filter: Option<Vec<String>>,
 }
 
+fn setup_logging() -> anyhow::Result<()> {
+    fern::Dispatch::new()
+        .format(|out, message, record| {
+            out.finish(format_args!(
+                "{}[{}] {}",
+                chrono::Local::now().format("[%Y-%m-%d][%H:%M:%S]"),
+                record.level(),
+                message
+            ))
+        })
+        // 设置日志的最低级别为 Debug 以捕获所有消息
+        .level(log::LevelFilter::Info)
+        // 将日志输出到标准输出
+        .chain(std::io::stdout())
+        // 同时将日志输出到文件
+        .chain(fern::log_file("pull.log")?)
+        // 应用配置
+        .apply()?;
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    setup_logging().expect("配置日志系统失败");
+
     let args = Args::parse();
 
     let mut fetcher = DateFilesFetcher::new(
@@ -33,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
     ).await?;
 
     if args.set_ignore_undownloaded {
+        log::info!("进入文件修复模式....");
         fetcher.set_ignore_undownloaded();
     }
 
